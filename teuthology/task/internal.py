@@ -35,7 +35,7 @@ def base(ctx, config):
     run.wait(
         ctx.cluster.run(
             args=[
-                'mkdir', '-m0755', '--',
+                'mkdir', '-p', '-m0755', '--',
                 testdir,
                 ],
             wait=False,
@@ -78,7 +78,9 @@ def lock_machines(ctx, config):
     machine_type = config[1]
     how_many = config[0]
     # We want to make sure there are always this many machines available
-    to_reserve = 5
+    to_reserve = teuth_config.reserve_machines
+    assert isinstance(to_reserve, int), 'reserve_machines must be integer'
+    assert (to_reserve >= 0), 'reserve_machines should >= 0'
 
     # change the status during the locking process
     report.try_push_job_info(ctx.config, dict(status='waiting'))
@@ -157,14 +159,23 @@ def lock_machines(ctx, config):
             break
         elif not ctx.block:
             assert 0, 'not enough machines are available'
+        else:
+            how_many = how_many - len(newly_locked)
+            assert how_many > 0, "lock_machines: how_many counter went" \
+                                 "negative, this shouldn't happen"
 
         log.warn('Could not lock enough machines, waiting...')
         time.sleep(10)
     try:
         yield
     finally:
-        if ctx.config.get('unlock_on_failure', False) or \
-                get_status(ctx.summary) == 'pass':
+        # If both unlock_on_failure and nuke-on-error are set, don't unlock now
+        # because we're just going to nuke (and unlock) later.
+        unlock_on_failure = (
+            ctx.config.get('unlock_on_failure', False)
+            and not ctx.config.get('nuke-on-error', False)
+        )
+        if get_status(ctx.summary) == 'pass' or unlock_on_failure:
             log.info('Unlocking machines...')
             for machine in ctx.config['targets'].iterkeys():
                 lock.unlock_one(ctx, machine, ctx.owner, ctx.archive)
@@ -179,7 +190,7 @@ def save_config(ctx, config):
         with file(os.path.join(ctx.archive, 'config.yaml'), 'w') as f:
             yaml.safe_dump(ctx.config, f, default_flow_style=False)
 
-def check_lock(ctx, config):
+def check_lock(ctx, config, check_up=True):
     """
     Check lock status of remote machines.
     """
@@ -192,7 +203,10 @@ def check_lock(ctx, config):
         log.debug('machine status is %s', repr(status))
         assert status is not None, \
             'could not read lock status for {name}'.format(name=machine)
-        assert status['up'], 'machine {name} is marked down'.format(name=machine)
+        if check_up:
+            assert status['up'], 'machine {name} is marked down'.format(
+                name=machine
+            )
         assert status['locked'], \
             'machine {name} is not locked'.format(name=machine)
         assert status['locked_by'] == ctx.owner, \
@@ -258,25 +272,23 @@ def timer(ctx, config):
         ctx.summary['duration'] = duration
 
 
-def connect(ctx, config):
+def add_remotes(ctx, config):
     """
-    Open a connection to a remote host.
+    Create a ctx.cluster object populated with remotes mapped to roles
     """
-    log.info('Opening connections...')
     remotes = []
     machs = []
     for name in ctx.config['targets'].iterkeys():
         machs.append(name)
     for t, key in ctx.config['targets'].iteritems():
         t = misc.canonicalize_hostname(t)
-        log.debug('connecting to %s', t)
         try:
             if ctx.config['sshkeys'] == 'ignore':
                 key = None
         except (AttributeError, KeyError):
             pass
-        remotes.append(
-            remote.Remote(name=t, host_key=key, keep_alive=True, console=None))
+        rem = remote.Remote(name=t, host_key=key, keep_alive=True)
+        remotes.append(rem)
     ctx.cluster = cluster.Cluster()
     if 'roles' in ctx.config:
         for rem, roles in zip(remotes, ctx.config['roles']):
@@ -287,6 +299,16 @@ def connect(ctx, config):
     else:
         for rem in remotes:
             ctx.cluster.add(rem, rem.name)
+
+
+def connect(ctx, config):
+    """
+    Connect to all remotes in ctx.cluster
+    """
+    log.info('Opening connections...')
+    for rem in ctx.cluster.remotes.iterkeys():
+        log.debug('connecting to %s', rem.name)
+        rem.connect()
 
 
 def push_inventory(ctx, config):
@@ -551,7 +573,7 @@ def syslog(ctx, config):
     run.wait(
         ctx.cluster.run(
             args=[
-                'mkdir', '-m0755', '--',
+                'mkdir', '-p', '-m0755', '--',
                 '{adir}/syslog'.format(adir=archive_dir),
                 ],
             wait=False,
@@ -718,7 +740,7 @@ def _download_and_run_chef(remote_):
     remote_.run(
         args=[
             'wget', '-q', '-O-',
-            'http://ceph.com/git/?p=ceph-qa-chef.git;a=blob_plain;f=solo/solo-from-scratch;hb=HEAD',
+            'http://git.ceph.com/?p=ceph-qa-chef.git;a=blob_plain;f=solo/solo-from-scratch;hb=HEAD',
             run.Raw('|'),
             'sh',
         ],

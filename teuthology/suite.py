@@ -4,7 +4,6 @@
 
 import copy
 from datetime import datetime
-import itertools
 import logging
 import os
 import requests
@@ -14,10 +13,12 @@ import smtplib
 import socket
 import sys
 import yaml
+import math
 from email.mime.text import MIMEText
 from tempfile import NamedTemporaryFile
 
 import teuthology
+import matrix
 from . import lock
 from .config import config, JobConfig
 from .exceptions import BranchNotFoundError, ScheduleFailError
@@ -58,6 +59,12 @@ def main(args):
     timeout = args['--timeout']
     filter_in = args['--filter']
     filter_out = args['--filter-out']
+
+    subset = None
+    if args['--subset']:
+        # take input string '2/3' and turn into (2, 3)
+        subset = tuple(map(int, args['--subset'].split('/')))
+        log.info('Passed subset=%s/%s' % (str(subset[0]), str(subset[1])))
 
     name = make_run_name(suite, ceph_branch, kernel_branch, kernel_flavor,
                          machine_type)
@@ -102,6 +109,7 @@ def main(args):
                          verbose=verbose,
                          filter_in=filter_in,
                          filter_out=filter_out,
+                         subset=subset,
                          )
     os.remove(base_yaml_path)
 
@@ -195,11 +203,11 @@ def create_initial_config(suite, suite_branch, ceph_branch, teuthology_branch,
             ver=ceph_hash), name)
     log.info("ceph version: {ver}".format(ver=ceph_version))
 
-    if teuthology_branch:
+    if teuthology_branch and teuthology_branch != 'master':
         if not get_branch_info('teuthology', teuthology_branch):
             exc = BranchNotFoundError(teuthology_branch, 'teuthology.git')
             schedule_fail(message=str(exc), name=name)
-    else:
+    elif not teuthology_branch:
         # Decide what branch of teuthology to use
         if get_branch_info('teuthology', ceph_branch):
             teuthology_branch = ceph_branch
@@ -209,11 +217,11 @@ def create_initial_config(suite, suite_branch, ceph_branch, teuthology_branch,
             teuthology_branch = 'master'
     log.info("teuthology branch: %s", teuthology_branch)
 
-    if suite_branch:
+    if suite_branch and suite_branch != 'master':
         if not get_branch_info('ceph-qa-suite', suite_branch):
             exc = BranchNotFoundError(suite_branch, 'ceph-qa-suite.git')
             schedule_fail(message=str(exc), name=name)
-    else:
+    elif not suite_branch:
         # Decide what branch of ceph-qa-suite to use
         if get_branch_info('ceph-qa-suite', ceph_branch):
             suite_branch = ceph_branch
@@ -240,7 +248,9 @@ def create_initial_config(suite, suite_branch, ceph_branch, teuthology_branch,
 
 def prepare_and_schedule(job_config, suite_repo_path, base_yaml_paths, limit,
                          num, timeout, dry_run, verbose,
-                         filter_in, filter_out):
+                         filter_in,
+                         filter_out,
+                         subset):
     """
     Puts together some "base arguments" with which to execute
     teuthology-schedule for each job, then passes them and other parameters to
@@ -281,6 +291,7 @@ def prepare_and_schedule(job_config, suite_repo_path, base_yaml_paths, limit,
         dry_run=dry_run,
         filter_in=filter_in,
         filter_out=filter_out,
+        subset=subset
     )
 
     if job_config.email and num_jobs:
@@ -456,6 +467,7 @@ def schedule_suite(job_config,
                    dry_run=True,
                    filter_in=None,
                    filter_out=None,
+                   subset=None
                    ):
     """
     schedule one suite.
@@ -464,7 +476,7 @@ def schedule_suite(job_config,
     suite_name = job_config.suite
     log.debug('Suite %s in %s' % (suite_name, path))
     configs = [(combine_path(suite_name, item[0]), item[1]) for item in
-               build_matrix(path)]
+               build_matrix(path, subset=subset)]
     log.info('Suite %s in %s generated %d jobs (not yet filtered)' % (
         suite_name, path, len(configs)))
 
@@ -675,7 +687,7 @@ def combine_path(left, right):
     return left
 
 
-def build_matrix(path):
+def generate_combinations(path, mat, generate_from, generate_to):
     """
     Return a list of items describe by path
 
@@ -699,50 +711,138 @@ def build_matrix(path):
     component will appear as a file with braces listing the selection
     of chosen subitems.
     """
-    if os.path.isfile(path):
+    ret = []
+    for i in range(generate_from, generate_to):
+        output = mat.index(i)
+        ret.append((
+            matrix.generate_desc(combine_path, output),
+            matrix.generate_paths(path, output, combine_path)))
+    return ret
+
+
+def build_matrix(path, _isfile=os.path.isfile,
+                 _isdir=os.path.isdir,
+                 _listdir=os.listdir,
+                 subset=None):
+    """
+    Return a list of items descibed by path such that if the list of
+    items is chunked into mincyclicity pieces, each piece is still a
+    good subset of the suite.
+
+    A good subset of a product ensures that each facet member appears
+    at least once.  A good subset of a sum ensures that the subset of
+    each sub collection reflected in the subset is a good subset.
+
+    A mincyclicity of 0 does not attempt to enforce the good subset
+    property.
+
+    The input is just a path.  The output is an array of (description,
+    [file list]) tuples.
+
+    For a normal file we generate a new item for the result list.
+
+    For a directory, we (recursively) generate a new item for each
+    file/dir.
+
+    For a directory with a magic '+' file, we generate a single item
+    that concatenates all files/subdirs (A Sum).
+
+    For a directory with a magic '%' file, we generate a result set
+    for each item in the directory, and then do a product to generate
+    a result list with all combinations (A Product).
+
+    The final description (after recursion) for each item will look
+    like a relative path.  If there was a % product, that path
+    component will appear as a file with braces listing the selection
+    of chosen subitems.
+
+    :param path:        The path to search for yaml fragments
+    :param _isfile:     Custom os.path.isfile(); for testing only
+    :param _isdir:      Custom os.path.isdir(); for testing only
+    :param _listdir:	Custom os.listdir(); for testing only
+    :param subset:	(index, outof)
+    """
+    mat = None
+    first = None
+    matlimit = None
+    if subset:
+        (index, outof) = subset
+        mat = _build_matrix(path, _isfile, _isdir, _listdir, mincyclicity=outof)
+        first = (mat.size() / outof) * index
+        if index == outof or index == outof - 1:
+            matlimit = mat.size()
+        else:
+            matlimit = (mat.size() / outof) * (index + 1)
+    else:
+        first = 0
+        mat = _build_matrix(path, _isfile, _isdir, _listdir)
+        matlimit = mat.size()
+    return generate_combinations(path, mat, first, matlimit)
+
+def _build_matrix(path, _isfile=os.path.isfile,
+                  _isdir=os.path.isdir, _listdir=os.listdir, mincyclicity=0, item=''):
+    if _isfile(path):
         if path.endswith('.yaml'):
-            return [(None, [path])]
-        return []
-    if os.path.isdir(path):
-        files = sorted(os.listdir(path))
+            return matrix.Base(item)
+        return None
+    if _isdir(path):
+        if path.endswith('.disable'):
+            return None
+        files = sorted(_listdir(path))
+        if len(files) == 0:
+            return None
         if '+' in files:
             # concatenate items
             files.remove('+')
-            raw = []
-            for fn in files:
-                raw.extend(build_matrix(os.path.join(path, fn)))
-            out = [(
-                '{' + ' '.join(files) + '}',
-                [a[1][0] for a in raw]
-            )]
-            return out
+            submats = []
+            for fn in sorted(files):
+                submat = _build_matrix(
+                    os.path.join(path, fn),
+                    _isfile,
+                    _isdir,
+                    _listdir,
+                    mincyclicity,
+                    fn)
+                if submat is not None:
+                    submats.append(submat)
+            return matrix.Concat(item, submats)
         elif '%' in files:
             # convolve items
             files.remove('%')
-            sublists = []
-            for fn in files:
-                raw = build_matrix(os.path.join(path, fn))
-                if raw:
-                    sublists.append([(combine_path(fn, item[0]), item[1])
-                                     for item in raw])
-            out = []
-            if sublists:
-                for sublist in itertools.product(*sublists):
-                    name = '{' + ' '.join([item[0] for item in sublist]) + '}'
-                    val = []
-                    for item in sublist:
-                        val.extend(item[1])
-                    out.append((name, val))
-            return out
+            submats = []
+            for fn in sorted(files):
+                submat = _build_matrix(
+                    os.path.join(path, fn),
+                    _isfile,
+                    _isdir,
+                    _listdir,
+                    mincyclicity=0,
+                    item=fn)
+                if submat is not None:
+                    submats.append(submat)
+            return matrix.Product(item, submats)
         else:
             # list items
-            out = []
-            for fn in files:
-                raw = build_matrix(os.path.join(path, fn))
-                out.extend([(combine_path(fn, item[0]), item[1])
-                           for item in raw])
-            return out
-    return []
+            submats = []
+            for fn in sorted(files):
+                submat = _build_matrix(
+                    os.path.join(path, fn),
+                    _isfile,
+                    _isdir,
+                    _listdir,
+                    mincyclicity,
+                    fn)
+                if submat is None:
+                    continue
+                if submat.cyclicity() < mincyclicity:
+                    submat = matrix.Cycle(
+                        int(math.ceil(
+                            mincyclicity / submat.cyclicity())),
+                        submat)
+                submats.append(submat)
+            return matrix.Sum(item, submats)
+    assert False, "Invalid path seen in _build_matrix"
+    return None
 
 
 def get_arch(machine_type):

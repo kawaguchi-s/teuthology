@@ -127,6 +127,7 @@ class TeuthologyConfig(YamlConfig):
     _defaults = {
         'archive_base': '/var/lib/teuthworker/archive',
         'automated_scheduling': False,
+        'reserve_machines': 5,
         'ceph_git_base_url': 'https://github.com/ceph/',
         'gitbuilder_host': 'gitbuilder.ceph.com',
         'lab_domain': 'front.sepia.ceph.com',
@@ -140,6 +141,7 @@ class TeuthologyConfig(YamlConfig):
         'watchdog_interval': 120,
         'kojihub_url': 'http://koji.fedoraproject.org/kojihub',
         'kojiroot_url': 'http://kojipkgs.fedoraproject.org/packages',
+        'koji_task_url': 'https://kojipkgs.fedoraproject.org/work/',
     }
 
     def __init__(self, yaml_path=None):

@@ -4,6 +4,7 @@ from datetime import datetime
 from mock import patch, Mock
 
 from teuthology import suite
+from teuthology.config import config
 
 
 class TestSuiteOffline(object):
@@ -25,7 +26,9 @@ class TestSuiteOffline(object):
         assert name.startswith('USER-')
 
     def test_gitbuilder_url(self):
-        ref_url = "http://gitbuilder.ceph.com/ceph-deb-squeeze-x86_64-basic/"
+        ref_url = "http://{host}/ceph-deb-squeeze-x86_64-basic/".format(
+            host=config.gitbuilder_host
+        )
         assert suite.get_gitbuilder_url('ceph', 'squeeze', 'deb', 'x86_64',
                                         'basic') == ref_url
 
@@ -241,3 +244,396 @@ class TestDistroDefaults(object):
         assert suite.get_distro_defaults('rhel', 'magna') == ('x86_64',
                                                               'rhel7_0',
                                                               'rpm')
+
+
+def make_fake_fstools(fake_filesystem):
+    """
+    Build a fake listdir() and isfile(), to be used instead of
+    os.listir() and os.isfile()
+
+    An example fake_filesystem value:
+        >>> fake_fs = {
+            'a_directory': {
+                'another_directory': {
+                    'a_file': None,
+                    'another_file': None,
+                },
+                'random_file': None,
+                'yet_another_directory': {
+                    'empty_directory': {},
+                },
+            },
+        }
+
+        >>> fake_listdir = make_fake_listdir(fake_fs)
+        >>> fake_listdir('a_directory/yet_another_directory')
+        ['empty_directory']
+        >>> fake_isfile('a_directory/yet_another_directory')
+        False
+
+    :param fake_filesystem: A dict representing a filesystem layout
+    """
+    assert isinstance(fake_filesystem, dict)
+
+    def fake_listdir(path, fsdict=False):
+        if fsdict is False:
+            fsdict = fake_filesystem
+
+        remainder = path.strip('/') + '/'
+        subdict = fsdict
+        while '/' in remainder:
+            next_dir, remainder = remainder.split('/', 1)
+            if next_dir not in subdict:
+                raise OSError(
+                    '[Errno 2] No such file or directory: %s' % next_dir)
+            subdict = subdict.get(next_dir)
+            if not isinstance(subdict, dict):
+                raise OSError('[Errno 20] Not a directory: %s' % next_dir)
+            if subdict and not remainder:
+                return subdict.keys()
+        return []
+
+    def fake_isfile(path, fsdict=False):
+        if fsdict is False:
+            fsdict = fake_filesystem
+
+        components = path.strip('/').split('/')
+        subdict = fsdict
+        for component in components:
+            if component not in subdict:
+                raise OSError(
+                    '[Errno 2] No such file or directory: %s' % component)
+            subdict = subdict.get(component)
+        if subdict is None:
+            return True
+        else:
+            return False
+
+    def fake_isdir(path, fsdict = False):
+        return not fake_isfile(path)
+    return fake_listdir, fake_isfile, fake_isdir
+
+class TestBuildMatrix(object):
+    def fragment_occurences(self, jobs, fragment):
+        # What fraction of jobs contain fragment?
+        count = 0
+        for (description, fragment_list) in jobs:
+            for item in fragment_list:
+                if item.endswith(fragment):
+                    count += 1
+        return count / float(len(jobs))
+
+    def test_concatenate_1x2x3(self):
+        fake_fs = {
+            'd0_0': {
+                '+': None,
+                'd1_0': {
+                    'd1_0_0.yaml': None,
+                },
+                'd1_1': {
+                    'd1_1_0.yaml': None,
+                    'd1_1_1.yaml': None,
+                },
+                'd1_2': {
+                    'd1_2_0.yaml': None,
+                    'd1_2_1.yaml': None,
+                    'd1_2_2.yaml': None,
+                },
+            },
+        }
+        fake_listdir, fake_isfile, fake_isdir = make_fake_fstools(fake_fs)
+        result = suite.build_matrix('d0_0', fake_isfile, fake_isdir,
+                                    fake_listdir)
+        assert len(result) == 1
+
+    def test_convolve_2x2(self):
+        fake_fs = {
+            'd0_0': {
+                '%': None,
+                'd1_0': {
+                    'd1_0_0.yaml': None,
+                    'd1_0_1.yaml': None,
+                },
+                'd1_1': {
+                    'd1_1_0.yaml': None,
+                    'd1_1_1.yaml': None,
+                },
+            },
+        }
+        fake_listdir, fake_isfile, fake_isdir = make_fake_fstools(fake_fs)
+        result = suite.build_matrix('d0_0', fake_isfile, fake_isdir,
+                                    fake_listdir)
+        assert len(result) == 4
+        assert self.fragment_occurences(result, 'd1_1_1.yaml') == 0.5
+
+    def test_convolve_2x2x2(self):
+        fake_fs = {
+            'd0_0': {
+                '%': None,
+                'd1_0': {
+                    'd1_0_0.yaml': None,
+                    'd1_0_1.yaml': None,
+                },
+                'd1_1': {
+                    'd1_1_0.yaml': None,
+                    'd1_1_1.yaml': None,
+                },
+                'd1_2': {
+                    'd1_2_0.yaml': None,
+                    'd1_2_1.yaml': None,
+                },
+            },
+        }
+        fake_listdir, fake_isfile, fake_isdir = make_fake_fstools(fake_fs)
+        result = suite.build_matrix('d0_0', fake_isfile, fake_isdir,
+                                    fake_listdir)
+        assert len(result) == 8
+        assert self.fragment_occurences(result, 'd1_2_0.yaml') == 0.5
+
+    def test_convolve_1x2x4(self):
+        fake_fs = {
+            'd0_0': {
+                '%': None,
+                'd1_0': {
+                    'd1_0_0.yaml': None,
+                },
+                'd1_1': {
+                    'd1_1_0.yaml': None,
+                    'd1_1_1.yaml': None,
+                },
+                'd1_2': {
+                    'd1_2_0.yaml': None,
+                    'd1_2_1.yaml': None,
+                    'd1_2_2.yaml': None,
+                    'd1_2_3.yaml': None,
+                },
+            },
+        }
+        fake_listdir, fake_isfile, fake_isdir = make_fake_fstools(fake_fs)
+        result = suite.build_matrix('d0_0', fake_isfile, fake_isdir,
+                                    fake_listdir)
+        assert len(result) == 8
+        assert self.fragment_occurences(result, 'd1_2_2.yaml') == 0.25
+
+    def test_convolve_with_concat(self):
+        fake_fs = {
+            'd0_0': {
+                '%': None,
+                'd1_0': {
+                    'd1_0_0.yaml': None,
+                },
+                'd1_1': {
+                    'd1_1_0.yaml': None,
+                    'd1_1_1.yaml': None,
+                },
+                'd1_2': {
+                    '+': None,
+                    'd1_2_0.yaml': None,
+                    'd1_2_1.yaml': None,
+                    'd1_2_2.yaml': None,
+                    'd1_2_3.yaml': None,
+                },
+            },
+        }
+        fake_listdir, fake_isfile, fake_isdir = make_fake_fstools(fake_fs)
+        result = suite.build_matrix('d0_0', fake_isfile, fake_isdir,
+                                    fake_listdir)
+        assert len(result) == 2
+        for i in result:
+            assert 'd0_0/d1_2/d1_2_0.yaml' in i[1]
+            assert 'd0_0/d1_2/d1_2_1.yaml' in i[1]
+            assert 'd0_0/d1_2/d1_2_2.yaml' in i[1]
+            assert 'd0_0/d1_2/d1_2_3.yaml' in i[1]
+
+    def test_emulate_teuthology_noceph(self):
+        fake_fs = {
+            'teuthology': {
+                'no-ceph': {
+                    '%': None,
+                    'clusters': {
+                        'single.yaml': None,
+                    },
+                    'distros': {
+                        'baremetal.yaml': None,
+                        'rhel7.0.yaml': None,
+                        'ubuntu12.04.yaml': None,
+                        'ubuntu14.04.yaml': None,
+                        'vps.yaml': None,
+                        'vps_centos6.5.yaml': None,
+                        'vps_debian7.yaml': None,
+                        'vps_rhel6.4.yaml': None,
+                        'vps_rhel6.5.yaml': None,
+                        'vps_rhel7.0.yaml': None,
+                        'vps_ubuntu14.04.yaml': None,
+                    },
+                    'tasks': {
+                        'teuthology.yaml': None,
+                    },
+                },
+            },
+        }
+        fake_listdir, fake_isfile, fake_isdir = make_fake_fstools(fake_fs)
+        result = suite.build_matrix('teuthology/no-ceph', fake_isfile,
+                                    fake_isdir, fake_listdir)
+        assert len(result) == 11
+        assert self.fragment_occurences(result, 'vps.yaml') == 1 / 11.0
+
+    def test_empty_dirs(self):
+        fake_fs = {
+            'teuthology': {
+                'no-ceph': {
+                    '%': None,
+                    'clusters': {
+                        'single.yaml': None,
+                    },
+                    'distros': {
+                        'baremetal.yaml': None,
+                        'rhel7.0.yaml': None,
+                        'ubuntu12.04.yaml': None,
+                        'ubuntu14.04.yaml': None,
+                        'vps.yaml': None,
+                        'vps_centos6.5.yaml': None,
+                        'vps_debian7.yaml': None,
+                        'vps_rhel6.4.yaml': None,
+                        'vps_rhel6.5.yaml': None,
+                        'vps_rhel7.0.yaml': None,
+                        'vps_ubuntu14.04.yaml': None,
+                    },
+                    'tasks': {
+                        'teuthology.yaml': None,
+                    },
+                },
+            },
+        }
+        fake_listdir, fake_isfile, fake_isdir = make_fake_fstools(fake_fs)
+        result = suite.build_matrix('teuthology/no-ceph', fake_isfile,
+                                    fake_isdir, fake_listdir)
+        fake_fs2 = {
+            'teuthology': {
+                'no-ceph': {
+                    '%': None,
+                    'clusters': {
+                        'single.yaml': None,
+                    },
+                    'distros': {
+                        'empty': {},
+                        'baremetal.yaml': None,
+                        'rhel7.0.yaml': None,
+                        'ubuntu12.04.yaml': None,
+                        'ubuntu14.04.yaml': None,
+                        'vps.yaml': None,
+                        'vps_centos6.5.yaml': None,
+                        'vps_debian7.yaml': None,
+                        'vps_rhel6.4.yaml': None,
+                        'vps_rhel6.5.yaml': None,
+                        'vps_rhel7.0.yaml': None,
+                        'vps_ubuntu14.04.yaml': None,
+                    },
+                    'tasks': {
+                        'teuthology.yaml': None,
+                    },
+                    'empty': {},
+                },
+            },
+        }
+        fake_listdir2, fake_isfile2, fake_isdir2 = make_fake_fstools(fake_fs2)
+        result2 = suite.build_matrix('teuthology/no-ceph', fake_isfile2,
+                                     fake_isdir2, fake_listdir2)
+        assert len(result) == 11
+        assert len(result2) == len(result)
+
+    def test_disable_extension(self):
+        fake_fs = {
+            'teuthology': {
+                'no-ceph': {
+                    '%': None,
+                    'clusters': {
+                        'single.yaml': None,
+                    },
+                    'distros': {
+                        'baremetal.yaml': None,
+                        'rhel7.0.yaml': None,
+                        'ubuntu12.04.yaml': None,
+                        'ubuntu14.04.yaml': None,
+                        'vps.yaml': None,
+                        'vps_centos6.5.yaml': None,
+                        'vps_debian7.yaml': None,
+                        'vps_rhel6.4.yaml': None,
+                        'vps_rhel6.5.yaml': None,
+                        'vps_rhel7.0.yaml': None,
+                        'vps_ubuntu14.04.yaml': None,
+                    },
+                    'tasks': {
+                        'teuthology.yaml': None,
+                    },
+                },
+            },
+        }
+        fake_listdir, fake_isfile, fake_isdir = make_fake_fstools(fake_fs)
+        result = suite.build_matrix('teuthology/no-ceph', fake_isfile,
+                                    fake_isdir, fake_listdir)
+        fake_fs2 = {
+            'teuthology': {
+                'no-ceph': {
+                    '%': None,
+                    'clusters': {
+                        'single.yaml': None,
+                    },
+                    'distros': {
+                        'baremetal.yaml': None,
+                        'rhel7.0.yaml': None,
+                        'ubuntu12.04.yaml': None,
+                        'ubuntu14.04.yaml': None,
+                        'vps.yaml': None,
+                        'vps_centos6.5.yaml': None,
+                        'vps_debian7.yaml': None,
+                        'vps_rhel6.4.yaml': None,
+                        'vps_rhel6.5.yaml': None,
+                        'vps_rhel7.0.yaml': None,
+                        'vps_ubuntu14.04.yaml': None,
+                        'forcefilevps_ubuntu14.04.yaml.disable': None,
+                        'forcefilevps_ubuntu14.04.yaml.anotherextension': None,
+                    },
+                    'tasks': {
+                        'teuthology.yaml': None,
+                        'forcefilevps_ubuntu14.04notyaml': None,
+                    },
+                    'forcefilevps_ubuntu14.04notyaml': None,
+                    'tasks.disable': {
+                        'teuthology2.yaml': None,
+                        'forcefilevps_ubuntu14.04notyaml': None,
+                    },
+                },
+            },
+        }
+        fake_listdir2, fake_isfile2, fake_isdir2 = make_fake_fstools(fake_fs2)
+        result2 = suite.build_matrix('teuthology/no-ceph', fake_isfile2,
+                                     fake_isdir2, fake_listdir2)
+        assert len(result) == 11
+        assert len(result2) == len(result)
+
+    def test_sort_order(self):
+        # This test ensures that 'ceph' comes before 'ceph-thrash' when yaml
+        # fragments are sorted.
+        fake_fs = {
+            'thrash': {
+                '%': None,
+                'ceph-thrash': {'default.yaml': None},
+                'ceph': {'base.yaml': None},
+                'clusters': {'mds-1active-1standby.yaml': None},
+                'debug': {'mds_client.yaml': None},
+                'fs': {'btrfs.yaml': None},
+                'msgr-failures': {'none.yaml': None},
+                'overrides': {'whitelist_wrongly_marked_down.yaml': None},
+                'tasks': {'cfuse_workunit_suites_fsstress.yaml': None},
+            },
+        }
+        fake_listdir, fake_isfile, fake_isdir = make_fake_fstools(fake_fs)
+        result = suite.build_matrix('thrash', fake_isfile,
+                                    fake_isdir, fake_listdir)
+        assert len(result) == 1
+        assert self.fragment_occurences(result, 'base.yaml') == 1
+        fragments = result[0][1]
+        assert fragments[0] == 'thrash/ceph/base.yaml'
+        assert fragments[1] == 'thrash/ceph-thrash/default.yaml'
+

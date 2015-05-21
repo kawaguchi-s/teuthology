@@ -21,6 +21,8 @@ from ..packaging import (
     get_koji_build_info,
     get_kojiroot_base_url,
     get_koji_package_name,
+    get_koji_task_rpm_info,
+    get_koji_task_result,
 )
 
 log = logging.getLogger(__name__)
@@ -67,7 +69,7 @@ def normalize_config(ctx, config):
     """
     if config is None or \
             len(filter(lambda x: x in ['tag', 'branch', 'sha1', 'kdb',
-                                       'deb', 'rpm', 'koji'],
+                                       'deb', 'rpm', 'koji', 'koji_task'],
                        config.keys())) == len(config.keys()):
         new_config = {}
         if config is None:
@@ -190,9 +192,12 @@ def install_firmware(ctx, config):
             log.info('Skipping firmware on distro kernel');
             return
         (role_remote,) = ctx.cluster.only(role).remotes.keys()
-        package_type = teuthology.get_system_type(role_remote)
+        package_type = role_remote.os.package_type
         if package_type == 'rpm':
-            return
+            role_remote.run(args=[
+                'sudo', 'yum', 'upgrade', '-y', 'linux-firmware',
+            ])
+            continue
         log.info('Installing linux-firmware on {role}...'.format(role=role))
         role_remote.run(
             args=[
@@ -272,14 +277,25 @@ def download_kernel(ctx, config):
         if isinstance(src, dict):
             # we're downloading a kernel from koji, the src dict here
             # is the build_info retrieved from koji using get_koji_build_info
-            build_id = src["id"]
-            log.info("Downloading kernel with build_id {build_id} on {role}...".format(
-                build_id=build_id,
-                role=role
-            ))
-            needs_download = True
-            baseurl = get_kojiroot_base_url(src)
-            pkg_name = get_koji_package_name("kernel", src)
+            if src.get("id"):
+                build_id = src["id"]
+                log.info("Downloading kernel with build_id {build_id} on {role}...".format(
+                    build_id=build_id,
+                    role=role
+                ))
+                needs_download = True
+                baseurl = get_kojiroot_base_url(src)
+                pkg_name = get_koji_package_name("kernel", src)
+            elif src.get("task_id"):
+                needs_download = True
+                log.info("Downloading kernel with task_id {task_id} on {role}...".format(
+                    task_id=src["task_id"],
+                    role=role
+                ))
+                baseurl = src["base_url"]
+                # this var is also poorly named as it's not the package name,
+                # but the full name of the rpm file to download.
+                pkg_name = src["rpm_name"]
         elif src.find('/') >= 0:
             # local package - src is path
             log.info('Copying kernel package {path} to {role}...'.format(
@@ -302,8 +318,8 @@ def download_kernel(ctx, config):
             needs_download = True
             package_type = role_remote.os.package_type
             if package_type == 'rpm':
-                system_type, system_ver = teuthology.get_system_type(
-                    role_remote, distro=True, version=True)
+                system_type = role_remote.os.name
+                system_ver = role_remote.os.version
                 if '.' in system_ver:
                    system_ver = system_ver.split('.')[0]
                 ldist = '{system_type}{system_ver}'.format(
@@ -393,8 +409,8 @@ def install_and_reboot(ctx, config):
 
         log.info('Installing kernel {src} on {role}...'.format(src=src,
                                                                role=role))
-        system_type = teuthology.get_system_type(role_remote)
-        if system_type == 'rpm':
+        package_type = role_remote.os.package_type
+        if package_type == 'rpm':
             proc = role_remote.run(
                 args=[
                     'sudo',
@@ -597,47 +613,53 @@ def wait_for_reboot(ctx, need_install, timeout, distro=False):
 
 def need_to_install_distro(ctx, role):
     """
-    Installing kernels on rpm won't setup grub/boot into them.
-    This installs the newest kernel package and checks its version
-    and compares against current (uname -r) and returns true if newest != current.
-    Similar check for deb.
+    Installing kernels on rpm won't setup grub/boot into them.  This installs
+    the newest kernel package and checks its version and compares against
+    current (uname -r) and returns true if newest != current.  Similar check
+    for deb.
     """
     (role_remote,) = ctx.cluster.only(role).remotes.keys()
-    system_type = teuthology.get_system_type(role_remote)
+    package_type = role_remote.os.package_type
     output, err_mess = StringIO(), StringIO()
-    role_remote.run(args=['uname', '-r' ], stdout=output, stderr=err_mess )
+    role_remote.run(args=['uname', '-r'], stdout=output)
     current = output.getvalue().strip()
-    if system_type == 'rpm':
-        role_remote.run(args=['sudo', 'yum', 'install', '-y', 'kernel'], stdout=output, stderr=err_mess )
+    if package_type == 'rpm':
+        role_remote.run(args=['sudo', 'yum', 'install', '-y', 'kernel'],
+                        stdout=output)
         if 'Nothing to do' in output.getvalue():
-            output.truncate(0), err_mess.truncate(0)
-            role_remote.run(args=['echo', 'no', run.Raw('|'), 'sudo', 'yum', 'reinstall', 'kernel', run.Raw('||'), 'true'], stdout=output, stderr=err_mess )
+            err_mess.truncate(0)
+            role_remote.run(args=['echo', 'no', run.Raw('|'), 'sudo', 'yum',
+                                  'reinstall', 'kernel', run.Raw('||'),
+                                  'true'], stderr=err_mess)
             if 'Skipping the running kernel' in err_mess.getvalue():
                 # Current running kernel is already newest and updated
                 log.info('Newest distro kernel already installed/running')
                 return False
             else:
-                output.truncate(0), err_mess.truncate(0)
-                role_remote.run(args=['sudo', 'yum', 'reinstall', '-y', 'kernel', run.Raw('||'), 'true'], stdout=output, stderr=err_mess )
-        #reset stringIO output.
-        output.truncate(0), err_mess.truncate(0)
-        role_remote.run(args=['rpm', '-q', 'kernel', '--last' ], stdout=output, stderr=err_mess )
+                role_remote.run(args=['sudo', 'yum', 'reinstall', '-y',
+                                      'kernel', run.Raw('||'), 'true'])
+        # reset stringIO output.
+        output.truncate(0)
+        role_remote.run(args=['rpm', '-q', 'kernel', '--last'], stdout=output)
         for kernel in output.getvalue().split():
             if kernel.startswith('kernel'):
                 if 'ceph' not in kernel:
                     newest = kernel.split('kernel-')[1]
                     break
 
-    if system_type == 'deb':
-        distribution = teuthology.get_system_type(role_remote, distro=True)
+    if package_type == 'deb':
+        distribution = role_remote.os.name
         newest = get_latest_image_version_deb(role_remote, distribution)
 
     output.close()
     err_mess.close()
     if current in newest:
         return False
-    log.info('Not newest distro kernel. Curent: {cur} Expected: {new}'.format(cur=current, new=newest))
+    log.info(
+        'Not newest distro kernel. Curent: {cur} Expected: {new}'.format(
+            cur=current, new=newest))
     return True
+
 
 def maybe_generate_initrd_rpm(remote, path, version):
     """
@@ -684,8 +706,8 @@ def install_kernel(remote, path=None):
 
     :param path: package path (for local and gitbuilder cases)
     """
-    system_type = teuthology.get_system_type(remote)
-    if system_type == 'rpm':
+    package_type = remote.os.package_type
+    if package_type == 'rpm':
         if path:
             version = get_image_version(remote, path)
             # This is either a gitbuilder or a local package and both of these
@@ -698,8 +720,8 @@ def install_kernel(remote, path=None):
         remote.run( args=['sudo', 'shutdown', '-r', 'now'], wait=False )
         return
 
-    if system_type == 'deb':
-        distribution = teuthology.get_system_type(remote, distro=True)
+    if package_type == 'deb':
+        distribution = remote.os.name
         newversion = get_latest_image_version_deb(remote, distribution)
         if 'ubuntu' in distribution:
             grub2conf = teuthology.get_file(remote, '/boot/grub/grub.cfg', True)
@@ -889,6 +911,7 @@ def get_latest_image_version_rpm(remote):
     log.debug("get_latest_image_version_rpm: %s", version)
     return version
 
+
 def get_latest_image_version_deb(remote, ostype):
     """
     Get kernel image version of the newest kernel deb package.
@@ -897,40 +920,46 @@ def get_latest_image_version_deb(remote, ostype):
     Round-about way to get the newest kernel uname -r compliant version string
     from the virtual package which is the newest kenel for debian/ubuntu.
     """
-    output, err_mess = StringIO(), StringIO()
-    newest=''
-    #Depend of virtual package has uname -r output in package name. Grab that.
+    output = StringIO()
+    newest = ''
+    # Depend of virtual package has uname -r output in package name. Grab that.
     if 'debian' in ostype:
-        remote.run(args=['sudo', 'apt-get', '-y', 'install', 'linux-image-amd64' ], stdout=output, stderr=err_mess )
-        remote.run(args=['dpkg', '-s', 'linux-image-amd64' ], stdout=output, stderr=err_mess )
+        remote.run(args=['sudo', 'apt-get', '-y', 'install',
+                         'linux-image-amd64'], stdout=output)
+        remote.run(args=['dpkg', '-s', 'linux-image-amd64'], stdout=output)
         for line in output.getvalue().split('\n'):
             if 'Depends:' in line:
                 newest = line.split('linux-image-')[1]
                 output.close()
-                err_mess.close()
                 return newest
-     #Ubuntu is a depend in a depend.
+    # Ubuntu is a depend in a depend.
     if 'ubuntu' in ostype:
         try:
-            remote.run(args=['sudo', 'apt-get', '-y', 'install', 'linux-image-current-generic' ], stdout=output, stderr=err_mess )
-            remote.run(args=['dpkg', '-s', 'linux-image-current-generic' ], stdout=output, stderr=err_mess )
+            remote.run(args=['sudo', 'apt-get', '-y', 'install',
+                             'linux-image-current-generic'])
+            remote.run(args=['dpkg', '-s', 'linux-image-current-generic'],
+                       stdout=output)
             for line in output.getvalue().split('\n'):
                 if 'Depends:' in line:
                     depends = line.split('Depends: ')[1]
-            remote.run(args=['dpkg', '-s', depends ], stdout=output, stderr=err_mess )
+                    remote.run(args=['sudo', 'apt-get', '-y', 'install',
+                                     depends])
+            remote.run(args=['dpkg', '-s', depends], stdout=output)
         except run.CommandFailedError:
             # Non precise ubuntu machines (like trusty) don't have
             # linux-image-current-generic so use linux-image-generic instead.
-            remote.run(args=['sudo', 'apt-get', '-y', 'install', 'linux-image-generic' ], stdout=output, stderr=err_mess )
-            remote.run(args=['dpkg', '-s', 'linux-image-generic' ], stdout=output, stderr=err_mess )
+            remote.run(args=['sudo', 'apt-get', '-y', 'install',
+                             'linux-image-generic'], stdout=output)
+            remote.run(args=['dpkg', '-s', 'linux-image-generic'],
+                       stdout=output)
         for line in output.getvalue().split('\n'):
             if 'Depends:' in line:
                 newest = line.split('linux-image-')[1]
                 if ',' in newest:
                     newest = newest.split(',')[0]
     output.close()
-    err_mess.close()
     return newest
+
 
 def get_sha1_from_pkg_name(path):
     """
@@ -947,6 +976,16 @@ def get_sha1_from_pkg_name(path):
     sha1 = match.group(1) if match else None
     log.debug("get_sha1_from_pkg_name: %s -> %s -> %s", path, basename, sha1)
     return sha1
+
+
+def remove_old_kernels(ctx):
+    for remote in ctx.cluster.remotes.keys():
+        package_type = remote.os.package_type
+        if package_type == 'rpm':
+            log.info("Removing old kernels from %s", remote)
+            args = ['sudo', 'package-cleanup', '-y', '--oldkernels']
+            remote.run(args=args)
+
 
 def task(ctx, config):
     """
@@ -968,6 +1007,28 @@ def task(ctx, config):
 
         kernel:
           sha1: 275dd19ea4e84c34f985ba097f9cddb539f54a50
+
+    To install from a koji build_id::
+
+        kernel:
+          koji: 416058
+
+    To install from a koji task_id::
+
+        kernel:
+          koji_task: 9678206
+
+    When installing from koji you also need to set the urls for koji hub
+    and the koji root in your teuthology.yaml config file. These are shown
+    below with their default values::
+
+        kojihub_url: http://koji.fedoraproject.org/kojihub
+        kojiroot_url: http://kojipkgs.fedoraproject.org/packages
+
+    When installing from a koji task_id you also need to set koji_task_url,
+    which is the base url used to download rpms from koji task results::
+
+        koji_task_url: https://kojipkgs.fedoraproject.org/work/
 
     To install local rpm (target should be an rpm system)::
 
@@ -1051,9 +1112,10 @@ def task(ctx, config):
             if need_to_install_distro(ctx, role):
                 need_install[role] = 'distro'
                 need_version[role] = 'distro'
-        elif role_config.get("koji", None):
+        elif role_config.get("koji") or role_config.get('koji_task'):
             # installing a kernel from koji
             build_id = role_config.get("koji")
+            task_id = role_config.get("koji_task")
             if role_remote.os.package_type != "rpm":
                 msg = (
                     "Installing a kernel from koji is only supported "
@@ -1069,12 +1131,27 @@ def task(ctx, config):
             # but I'm not sure where, so we'll leave it here for now.
             install_package('koji', role_remote)
 
-            # get information about this build from koji
-            build_info = get_koji_build_info(build_id, role_remote, ctx)
-            version = "{ver}-{rel}.x86_64".format(
-                ver=build_info["version"],
-                rel=build_info["release"]
-            )
+            if build_id:
+                # get information about this build from koji
+                build_info = get_koji_build_info(build_id, role_remote, ctx)
+                version = "{ver}-{rel}.x86_64".format(
+                    ver=build_info["version"],
+                    rel=build_info["release"]
+                )
+            elif task_id:
+                # get information about results of this task from koji
+                task_result = get_koji_task_result(task_id, role_remote, ctx)
+                # this is not really 'build_info', it's a dict of information
+                # about the kernel rpm from the task results, but for the sake
+                # of reusing the code below I'll still call it that.
+                build_info = get_koji_task_rpm_info(
+                    'kernel',
+                    task_result['rpms']
+                )
+                # add task_id so we can know later that we're installing
+                # from a task and not a build.
+                build_info["task_id"] = task_id
+                version = build_info["version"]
 
             if need_to_install(ctx, role, version):
                 need_install[role] = build_info
@@ -1123,6 +1200,8 @@ def task(ctx, config):
         # enable or disable kdb if specified, otherwise do not touch
         if role_config.get('kdb') is not None:
             kdb[role] = role_config.get('kdb')
+
+    remove_old_kernels(ctx)
 
     if need_install:
         install_firmware(ctx, need_install)

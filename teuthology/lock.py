@@ -8,13 +8,11 @@ import collections
 import os
 import requests
 import urllib
-from distutils.spawn import find_executable
 
 import teuthology
 from . import misc
 from . import provision
 from .config import config
-from .contextutil import safe_while
 from .lockstatus import get_status
 
 log = logging.getLogger(__name__)
@@ -47,7 +45,7 @@ def get_distro_from_downburst():
                                  u'14.04(trusty)', u'utopic(utopic)'],
                      u'sles': [u'11-sp2'],
                      u'debian': [u'6.0', u'7.0']}
-    executable_cmd = find_executable('downburst')
+    executable_cmd = provision.downburst_executable()
     if not executable_cmd:
         log.warn("Downburst not found!")
         log.info('Using default values for supported os_type/os_version')
@@ -120,6 +118,31 @@ def get_statuses(machines):
     else:
         statuses = list_locks()
     return statuses
+
+
+def json_matching_statuses(json_file_or_str, statuses):
+    """
+    Filter statuses by json dict in file or fragment; return list of
+    matching statuses.  json_file_or_str must be a file containing
+    json or json in a string.
+    """
+    try:
+        open(json_file_or_str, 'r')
+    except IOError:
+        query = json.loads(json_file_or_str)
+    else:
+        query = json.load(json_file_or_str)
+
+    if not isinstance(query, dict):
+        raise RuntimeError('--json-query must be a dict')
+
+    return_statuses = list()
+    for status in statuses:
+        for k, v in query.iteritems():
+            if misc.is_in_dict(k, v, status):
+                return_statuses.append(status)
+
+    return return_statuses
 
 
 def main(ctx):
@@ -208,6 +231,8 @@ def main(ctx):
                 statuses = [_status for _status in statuses
                             if _status['description'] is not None and
                             _status['description'].find(ctx.desc_pattern) >= 0]
+            if ctx.json_query:
+                statuses = json_matching_statuses(ctx.json_query, statuses)
 
             # When listing, only show the vm_host's name, not every detail
             for s in statuses:
@@ -282,8 +307,8 @@ def main(ctx):
                 )
                 if len(result) < ctx.num_to_lock:
                     log.error("Locking failed.")
-                    for machn in result:
-                        unlock_one(ctx, machn)
+                    for machine in result:
+                        unlock_one(ctx, machine, user)
                     ret = 1
                 else:
                     log.info("Successfully Locked:\n%s\n" % shortnames)
@@ -372,7 +397,7 @@ def lock_many(ctx, num, machine_type, user=None, description=None,
                     else:
                         log.error('Unable to create virtual machine: %s',
                                   machine)
-                        unlock_one(ctx, machine)
+                        unlock_one(ctx, machine, user)
                 return ok_machs
             return machines
         elif response.status_code == 503:
@@ -427,9 +452,7 @@ def unlock_many(names, user):
     return response.ok
 
 
-def unlock_one(ctx, name, user=None, description=None):
-    if user is None:
-        user = misc.get_user()
+def unlock_one(ctx, name, user, description=None):
     name = misc.canonicalize_hostname(name, user=None)
     if not provision.destroy_if_vm(ctx, name, user, description):
         log.error('downburst destroy failed for %s', name)
@@ -492,9 +515,10 @@ def find_stale_locks(owner=None):
         ... because we really want "nodes that were locked for a particular job
         and are still locked" and the above is currently the best way to guess.
         """
+        desc = node_dict['description']
         if (node_dict['locked'] is True and
-            node_dict['description'] is not None and
-                node_dict['description'].count('/') > 1):
+            desc is not None and desc.startswith('/') and
+                desc.count('/') > 1):
             return True
         return False
 
@@ -539,17 +563,6 @@ def find_stale_locks(owner=None):
 
 def update_lock(name, description=None, status=None, ssh_pub_key=None):
     name = misc.canonicalize_hostname(name, user=None)
-    # Only do VM specific things (key lookup) if we are not
-    # Just updating the status (like marking down).
-    if not status:
-        status_info = get_status(name)
-        if status_info['is_vm']:
-            with safe_while(sleep=1, tries=15, _raise=False,
-                            action='ssh-keyscan') as proceed:
-                while proceed():
-                    ssh_key = ssh_keyscan([name])
-                    if ssh_key:
-                        break
     updated = {}
     if description is not None:
         updated['description'] = description
@@ -616,7 +629,8 @@ def ssh_keyscan(hostnames):
 
     keys_dict = dict()
     for line in p.stderr.readlines():
-        if not line.startswith('#'):
+        line = line.strip()
+        if line and not line.startswith('#'):
             log.error(line)
     for line in p.stdout.readlines():
         host, key = line.strip().split(' ', 1)
